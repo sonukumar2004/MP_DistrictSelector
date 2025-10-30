@@ -1,17 +1,147 @@
 import express from 'express';
 import cors from 'cors';
+import mongoose from 'mongoose';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import dotenv from 'dotenv';
 import NodeCache from 'node-cache';
-import cron from 'node-cron';
-import axios from 'axios';
+
+dotenv.config();
 
 const app = express();
 const cache = new NodeCache({ stdTTL: 3600 });
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
+// Middleware
 app.use(cors());
 app.use(express.json());
 
-// Mock data for Madhya Pradesh districts (in real scenario, fetch from data.gov.in)
+// --- MongoDB Connection ---
+const connectDB = async () => {
+  try {
+    await mongoose.connect(process.env.MONGO_URI, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+    });
+    console.log('MongoDB Connected...');
+  } catch (err) {
+    console.error(err.message);
+    process.exit(1); // Exit process with failure
+  }
+};
+connectDB();
+
+// --- Mongoose User Schema and Model ---
+const UserSchema = new mongoose.Schema({
+  name: {
+    type: String,
+    required: true,
+  },
+  email: {
+    type: String,
+    required: true,
+    unique: true,
+  },
+  password: {
+    type: String,
+    required: true,
+  },
+  date: {
+    type: Date,
+    default: Date.now,
+  },
+});
+
+const User = mongoose.model('user', UserSchema);
+
+// --- JWT Generation ---
+const generateToken = (user) => {
+  return jwt.sign({ id: user.id, name: user.name }, process.env.JWT_SECRET, {
+    expiresIn: '8h',
+  });
+};
+
+// --- Auth Endpoints ---
+app.post('/api/auth/register', async (req, res) => {
+  const { name, email, password } = req.body;
+
+  if (!name || !email || !password) {
+    return res.status(400).json({ message: 'Please enter all fields' });
+  }
+
+  try {
+    let user = await User.findOne({ email });
+    if (user) {
+      return res.status(400).json({ message: 'User already exists' });
+    }
+
+    user = new User({
+      name,
+      email,
+      password,
+    });
+
+    const salt = await bcrypt.genSalt(10);
+    user.password = await bcrypt.hash(password, salt);
+
+    await user.save();
+
+    const token = generateToken(user);
+    res.status(201).json({
+      token,
+      user: { name: user.name, email: user.email },
+    });
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).send('Server error');
+  }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ message: 'Please enter all fields' });
+  }
+
+  try {
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(400).json({ message: 'Invalid credentials' });
+    }
+
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(400).json({ message: 'Invalid credentials' });
+    }
+
+    const token = generateToken(user);
+    res.json({
+      token,
+      user: { name: user.name, email: user.email },
+    });
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).send('Server error');
+  }
+});
+
+// --- Auth Middleware ---
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
+
+  if (token == null) return res.sendStatus(401); // if there isn't any token
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) return res.sendStatus(403); // if token is no longer valid
+    req.user = user;
+    next(); // move on to the next middleware
+  });
+};
+
+
+// --- Mock Data (Preserved) ---
 const mpDistricts = [
   { id: 1, name: 'Bhopal', code: 'BP' },
   { id: 2, name: 'Indore', code: 'IN' },
@@ -23,7 +153,6 @@ const mpDistricts = [
   { id: 8, name: 'Satna', code: 'ST' }
 ];
 
-// Mock MGNREGA data
 const generateMockData = (districtId) => {
   const baseData = {
     workers: Math.floor(Math.random() * 5000) + 1000,
@@ -40,18 +169,7 @@ const generateMockData = (districtId) => {
   };
 };
 
-// Auth middleware (simple mock)
-const users = [];
-const authenticateToken = (req, res, next) => {
-  const token = req.headers['authorization'];
-  if (token === 'mock-token') {
-    next();
-  } else {
-    res.status(401).json({ error: 'Unauthorized' });
-  }
-};
-
-// Routes
+// --- API Routes ---
 app.get('/api/states', (req, res) => {
   res.json([{ id: 1, name: 'Madhya Pradesh', code: 'MP' }]);
 });
@@ -60,6 +178,7 @@ app.get('/api/districts', (req, res) => {
   res.json(mpDistricts);
 });
 
+// Example of a protected route
 app.get('/api/district/:id/summary', authenticateToken, (req, res) => {
   const districtId = parseInt(req.params.id);
   const summary = generateMockData(districtId);
@@ -84,18 +203,6 @@ app.get('/api/district/:id/history', authenticateToken, (req, res) => {
   }
   
   res.json(history.reverse());
-});
-
-// Auth endpoints
-app.post('/api/auth/register', (req, res) => {
-  const { name, email, password } = req.body;
-  users.push({ id: users.length + 1, name, email, password });
-  res.json({ token: 'mock-token', user: { name, email } });
-});
-
-app.post('/api/auth/login', (req, res) => {
-  const { email, password } = req.body;
-  res.json({ token: 'mock-token', user: { name: 'User', email } });
 });
 
 app.get('/api/state/overview', (req, res) => {
